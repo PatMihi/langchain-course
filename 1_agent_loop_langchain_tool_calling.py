@@ -6,9 +6,10 @@ from langchain.chat_models import init_chat_model
 from langchain.tools import tool
 from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 from langsmith import traceable
+from pydantic import ValidationError
 
 MAX_ITERATIONS = 10
-MODEL = "qwen3:1.7b"
+MODEL = "openai:gpt-4.1-mini"  # "llama3.2:latest"
 
 
 # --- Tools (LangChain @tool decorator) ---
@@ -40,7 +41,7 @@ def run_agent(question: str):
     tools = [get_product_price, apply_discount]
     tools_dict = {t.name: t for t in tools}
 
-    llm = init_chat_model(f"ollama:{MODEL}", temperature=0)
+    llm = init_chat_model(MODEL, temperature=0)
     llm_with_tools = llm.bind_tools(tools)
 
     print(f"Question: {question}")
@@ -60,12 +61,22 @@ def run_agent(question: str):
                 "returned by get_product_price — do NOT pass a made-up number.\n"
                 "3. NEVER calculate discounts yourself using math. "
                 "Always use the apply_discount tool.\n"
-                "4. If the user does not specify a discount tier, "
-                "ask them which tier to use — do NOT assume one."
+                "4. Only ask the user a question if the discount tier is "
+                "completely missing from their message. If they mention a tier "
+                "(e.g. 'gold discount'), that counts as specified — do NOT ask "
+                "for confirmation.\n"
+                "5. Use the product name exactly as the user wrote it as the "
+                "'product' argument (e.g. 'laptop'). Do NOT ask for a specific "
+                "model or extra details — just call get_product_price.\n"
+                "6. Call only ONE tool per turn. Never put instructions or "
+                "text in an argument; arguments must be real values."
             )
         ),
         HumanMessage(content=question),
     ]
+
+    had_error = False
+    nudged = False
 
     for iteration in range(1, MAX_ITERATIONS + 1):
         print(f"\n--- Iteration {iteration} ---")
@@ -73,6 +84,22 @@ def run_agent(question: str):
         ai_message = llm_with_tools.invoke(messages)
 
         tool_calls = ai_message.tool_calls
+
+        # Small models sometimes answer in text right after a tool error
+        # (e.g. "please call X") instead of making the tool call. Nudge once.
+        if not tool_calls and had_error and not nudged:
+            nudged = True
+            print("  [Nudge] No tool call after an error; asking the model to call the tool")
+            messages.append(ai_message)
+            messages.append(
+                HumanMessage(
+                    content=(
+                        "Do not reply with text. You must call the get_product_price "
+                        "tool yourself right now using a tool call, then continue."
+                    )
+                )
+            )
+            continue
 
         # If no tool calls, this is the final answer
         if not tool_calls:
@@ -91,7 +118,19 @@ def run_agent(question: str):
         if tool_to_use is None:
             raise ValueError(f"Tool '{tool_name}' not found")
 
-        observation = tool_to_use.invoke(tool_args)
+        try:
+            observation = tool_to_use.invoke(tool_args)
+        except ValidationError as e:
+            # Feed the error back to the model so it can correct itself
+            observation = (
+                f"ERROR: invalid arguments for {tool_name}: {e}\n"
+                "Arguments must be real values, not instructions. "
+                "If you need a value from another tool (e.g. a price), "
+                "call that tool first, wait for its result, then use the "
+                "exact value it returned."
+            )
+            had_error = True
+            print(f"  [Tool Error] {e}")
 
         print(f"  [Tool Result] {observation}")
 
